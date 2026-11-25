@@ -1,0 +1,422 @@
+POD - PEER OUTLIER DETECTION
+A summary of the library: what it does, how it works, its API, and how to
+use it.
+
+Version:  0.1.0
+Status:   host tests pass with gcc and clang; cross-compiles for Cortex-M
+          and RISC-V; built and run as a Zephyr module (tested on
+          FRDM-MCXA153 and FRDM-MCXA577 builds; an earlier version was
+          benchmarked on a real MCXA153). Simulated data only so far.
+
+
+1. WHAT IT DOES
+===============
+
+pod watches a population of similar things ("entities"), each described by
+the same handful of numbers ("features"), and points out the one that is
+going wrong. Examples:
+
+  - 32 optical modules described by temperature, laser bias, Tx/Rx power...
+  - 50 cooling fans described by rpm, motor current, bearing temperature
+  - power supplies, motors, disks, servers, sensors...
+
+The idea is simple: "look at dozens of units side by side and spot the odd
+one out". It needs:
+
+  - no pretraining: nothing is learned offline, and no model is shipped;
+  - no programmed limits: there is no "temperature must stay below X"
+    anywhere, so the library has no knowledge of units or physics;
+  - no fixed sizes: the number of entities and features is chosen at
+    runtime (up to 65535 entities and 1024 features; memory is the practical
+    limit).
+
+It answers two questions about every entity, every cycle:
+
+  DIFFERENT  Is this entity unlike its peers right now?
+             (compares current values)
+  CHANGING   Is this entity changing in a way its peers are not?
+             (compares each entity's recent change with its peers' changes)
+
+CHANGING is usually the alert to act on. It catches slow degradation, such
+as a laser aging over months or a fibre slowly losing light, and it ignores
+things that happen to everyone at once, such as the room warming up or a
+cooling failure. DIFFERENT also flags entities that are permanently unusual
+but healthy (a module on a longer fibre run, a fan in a hot corner). Treat
+it as information.
+
+Because everything is relative to peers, the library needs a reasonable
+group: at least 8 like entities by default.
+
+
+2. HOW IT WORKS
+===============
+
+Each call to pod_update() runs one cycle, in five steps.
+
+2.1 Read
+--------
+For every enabled entity, pod calls your read callback, which fills in that
+entity's current features as floats. pod pulls the data when it needs it,
+so the data can stay wherever it already lives (for optics: the CMIS bytes
+your poller keeps in SRAM). If the callback returns false (absent, not
+ready, faulted), the entity sits out this cycle.
+
+2.2 Smooth and remember
+-----------------------
+Per entity and feature, pod keeps three running values:
+
+  fast   a short average (default 4 cycles): "now", with noise smoothed
+  slow   a long average (default 168 cycles = 1 week hourly): "before"
+  dev    the entity's typical deviation from "before"
+
+"slow" is a Huber-style robust average: once warmed up, one sample can move
+it by at most 3 x dev. A short glitch therefore barely moves the
+reference, while a lasting shift is still absorbed gradually.
+
+  level  = fast            (used by the DIFFERENT view)
+  change = fast - slow     (used by the CHANGING view)
+
+No time series is stored, just three floats per feature per entity.
+
+2.3 Compare with peers
+----------------------
+Entities are compared only within their group (e.g. the same part number).
+For each group, and for each view, pod builds an n x d table (one row per
+entity: its levels, or its changes) and runs two complementary tests on it.
+
+(a) Isolation Forest, fitted on the spot.
+    A tree splits the group again and again: a random feature, cut at a
+    random point between that feature's min and max. An outlier ends up
+    alone after only a few cuts, while an entity inside the crowd needs
+    many. The average number of cuts over many random trees (100 by
+    default) becomes a score from 0 to 1: about 0.5 is ordinary, near 1 is
+    easy to isolate.
+      - The forest is fitted on the current group and scores that group in
+        the same pass. Each tree is built, used and discarded, so memory
+        does not grow with the number of trees, and nothing is stored
+        between cycles.
+      - Cuts are drawn between each feature's own min and max, so units and
+        scales do not matter (°C, mA, dBm and rpm can be mixed freely).
+      - It catches combinations: an entity slightly off on several features
+        at once.
+      - For groups larger than 256, each tree uses a random subsample of
+        256 (the standard choice), and every entity is still scored.
+
+(b) Per-feature robust z-score.
+    For every feature: z = 0.6745 x (value - group median) / (median
+    absolute deviation). That's a z-score that a few outliers can't
+    distort.
+      - It catches an entity that is far out on one feature only. Isolation
+        Forest is weak there, because it picks the informative feature only
+        1 time in d, so a single-feature outlier gets diluted. This matters
+        in practice: a degrading fibre shows up in Rx power and nothing
+        else.
+      - The cutoff is Bonferroni-corrected for the n x d values tested,
+        giving a 1% chance per group snapshot of any false hit (about 4.2
+        for 32 entities x 7 features). It adapts to the group size
+        automatically.
+
+An entity is a CANDIDATE in a view when either
+    - its isolation score is above 0.5 and stands out from the group's
+      scores (robust z of the score >= 3.5), or
+    - one of its features exceeds the corrected per-feature cutoff.
+
+pod also records which feature sets each entity apart most, and that
+feature's z. This is the "why" behind an alert.
+
+2.4 Persistence
+---------------
+An entity becomes an ALERT in a view when it was a candidate in 18 of the
+last 24 cycles (configurable). This filters out noise and one-off glitches,
+while a real drift, which lasts for days, gets through.
+
+2.5 Warm-up and lifecycle
+-------------------------
+  - DIFFERENT works from the very first cycle, since it needs no history.
+  - An entity joins CHANGING after 24 samples (configurable).
+  - Changing an entity's group, disabling it, or calling pod_reset_entity()
+    (when the physical unit is swapped) clears its history.
+
+
+3. API
+======
+
+Headers (include/pod/):
+  pod.h       the engine; usually the only header you need
+  iforest.h   the Isolation Forest on its own (any float matrix)
+  robust.h    median / MAD / robust z / normal quantile helpers
+
+3.1 Types
+---------
+  struct pod                 detector state (about 100 bytes); treat as opaque
+  struct pod_config          settings (see 3.4)
+  struct pod_result          per-entity output (see section 5)
+  typedef bool (*pod_read_fn)(void *user, unsigned entity, float *out);
+
+3.2 Memory
+----------
+All arrays live in a buffer that you provide. pod never allocates memory.
+
+  size_t pod_mem_size(unsigned n_entities, unsigned n_features,
+                      const struct pod_config *cfg);    /* runtime */
+  POD_MEM_SIZE(n, d)                     /* compile-time constant */
+  POD_MEM_DEFINE(name, n, d);            /* declares an aligned static buffer */
+
+  Examples: 32 x 7 = 6.4 KB, 64 x 6 = 11.7 KB, 128 x 7 = 25.4 KB,
+  256 x 16 = 87.7 KB. That's roughly 16 bytes x n x d, plus about 60 bytes
+  per entity.
+
+3.3 Functions
+-------------
+  void pod_config_default(struct pod_config *cfg);
+
+  int  pod_init(struct pod *p, const struct pod_config *cfg,  /* NULL = defaults */
+                unsigned n_entities, unsigned n_features,
+                pod_read_fn read, void *user,                 /* your callback */
+                void *mem, size_t mem_size);                  /* 0, or -1 */
+
+  void pod_set_group(struct pod *p, unsigned entity, uint16_t group);
+  void pod_set_enabled(struct pod *p, unsigned entity, bool enabled);
+  void pod_reset_entity(struct pod *p, unsigned entity);
+
+  int  pod_update(struct pod *p);    /* one cycle; returns the number of
+                                        entities in alert, or -1 */
+
+  const struct pod_result *pod_result(const struct pod *p, unsigned entity);
+  float pod_level (const struct pod *p, unsigned entity, unsigned feature);
+  float pod_change(const struct pod *p, unsigned entity, unsigned feature);
+  const char *pod_view_name(unsigned view);       /* "different"/"changing" */
+
+  Standalone Isolation Forest (iforest.h), for use outside the engine:
+  int  iforest_score(const float *x, unsigned n, unsigned d, unsigned stride,
+                     const struct iforest_params *p, uint32_t *rng,
+                     void *scratch, size_t scratch_size, float *score);
+  size_t iforest_scratch_size(unsigned n, unsigned d, unsigned max_samples);
+
+3.4 Configuration (struct pod_config)
+-------------------------------------
+None of these is a limit on a measured value. The defaults suit one
+pod_update() per hour.
+
+  n_trees        100   trees per forest (cost is linear in this)
+  max_samples    256   forest subsample per tree
+  min_group        8   smallest group compared with peers
+  fast_cycles      4   smoothing of "now"
+  slow_cycles    168   length of "before" (1 week of hourly cycles)
+  warmup_cycles   24   samples before an entity joins CHANGING
+  persist_window  24   cycles looked back for an alert (max 32)
+  persist_count   18   candidate cycles needed within that window
+  z_cutoff       3.5   robust z for an isolation score (Iglewicz-Hoaglin)
+  family_alpha  0.01   false-alarm rate per group snapshot, per-feature test
+  seed                 random seed
+
+If you call pod_update() at a different rate, scale the cycle counts
+accordingly (for example, every 10 minutes: slow_cycles 1008 for a week).
+
+
+4. HOW TO USE IT
+================
+
+4.1 Init
+--------
+  #include "pod/pod.h"
+
+  #define N 50                    /* entities */
+  #define D 3                     /* features */
+
+  static bool read_fan(void *user, unsigned i, float *out)
+  {
+          const struct fan *f = &((const struct fan *)user)[i];
+          if (!f->present)
+                  return false;                 /* skipped this cycle */
+          out[0] = f->rpm;
+          out[1] = f->current_a;
+          out[2] = f->bearing_temp_c;
+          return true;
+  }
+
+  static struct fan fans[N];      /* wherever your data already lives */
+  POD_MEM_DEFINE(pod_mem, N, D);
+  static struct pod pod;
+
+  void monitor_init(void)
+  {
+          pod_init(&pod, NULL, N, D, read_fan, fans, pod_mem, sizeof(pod_mem));
+
+          /* optional: only compare like with like */
+          for (unsigned i = 0; i < N; i++)
+                  pod_set_group(&pod, i, fans[i].model_id);
+  }
+
+With a runtime-sized buffer instead:
+  size_t need = pod_mem_size(n, d, NULL);
+  void *mem = my_alloc(need);              /* 4-byte aligned */
+  pod_init(&pod, NULL, n, d, read_fn, ctx, mem, need);
+
+4.2 Runtime
+-----------
+  void monitor_tick(void)                  /* e.g. from a 1-hour k_timer/work item */
+  {
+          if (pod_update(&pod) > 0) {
+                  for (unsigned i = 0; i < N; i++) {
+                          const struct pod_result *r = pod_result(&pod, i);
+                          if (r->flags & POD_FLAG_ALERT_CHANGING)
+                                  report(i, r->top_feature[POD_VIEW_CHANGING],
+                                            r->top_feature_z[POD_VIEW_CHANGING]);
+                  }
+          }
+  }
+
+  On events:
+    unit swapped (new serial number) -> pod_reset_entity(&pod, i);
+    slot emptied / filled            -> pod_set_enabled(&pod, i, false/true);
+
+Threading: pod takes no locks. Call pod_update() from one thread. If
+another thread can rewrite an entity's data during the read callback,
+handle that inside the callback (a lock, or a sequence counter). The CMIS
+adapter has optional lock/unlock hooks for this.
+
+4.3 The CMIS (optical module) adapter
+-------------------------------------
+adapters/cmis provides a ready-made read callback for optical modules,
+working from cached CMIS records:
+
+  struct cmis_record { uint8_t lower[128]; uint8_t page11h[128]; };
+
+  The record holds the module's lower memory and page 11h, stored exactly
+  as read over I2C. pod_cmis_read() decodes 7 features over the lanes in
+  DPActivated state, and skips modules that are not in the Ready state:
+  temperature, Vcc, mean Tx bias, mean Tx power (dBm), mean Rx power (dBm),
+  Rx lane spread (dB), and Tx efficiency (Tx dBm - 10 log10 bias).
+
+  static struct cmis_record records[32];         /* your poller fills these */
+  static struct pod_cmis_source src = { .records = records };
+  POD_MEM_DEFINE(mem, 32, POD_CMIS_N_FEATURES);
+  pod_init(&pod, NULL, 32, POD_CMIS_N_FEATURES, pod_cmis_read, &src,
+           mem, sizeof(mem));
+  ...
+  pod_cmis_feature_name(r->top_feature[POD_VIEW_CHANGING])  -> "rx_power"
+
+Writing an adapter for something else just means writing one read function.
+
+
+5. HOW IT REPORTS OUTLIERS
+==========================
+
+After each pod_update(), every entity has a struct pod_result:
+
+  ready                 the callback returned data this cycle
+  scored[view]          compared with peers in this view this cycle
+                        (false if the group is too small or still warming up)
+  score[view]           isolation score, 0..1 (~0.5 ordinary, near 1 isolated)
+  score_z[view]         how far that score stands out in the group (robust z)
+  top_feature[view]     index of the feature that differs most from peers
+  top_feature_z[view]   its robust z (sign = direction: negative = lower)
+  flags                 bit set:
+     POD_FLAG_CAND_DIFFERENT   stood out this cycle   (DIFFERENT view)
+     POD_FLAG_CAND_CHANGING    stood out this cycle   (CHANGING view)
+     POD_FLAG_ALERT_DIFFERENT  stood out persistently (DIFFERENT view)
+     POD_FLAG_ALERT_CHANGING   stood out persistently (CHANGING view)
+
+pod_update() returns how many entities have an ALERT flag set, so the
+common case of "nothing wrong" is a single comparison.
+
+Reading an alert, for example:
+  flags = ALERT_CHANGING, top_feature = rx_power, top_feature_z = -4.6
+  -> "module 25's Rx power is falling in a way its peers' isn't, 4.6 robust
+     standard deviations out"
+
+  flags = ALERT_DIFFERENT, top_feature = rx_power, top_feature_z = -5.4,
+  but no ALERT_CHANGING
+  -> "module 7 has much lower Rx power than its peers, but it's stable"
+     (e.g. a longer fibre run)
+
+pod_level() and pod_change() give the smoothed values behind the decision,
+which is useful for logging or a dashboard.
+
+Alerts clear by themselves once the entity stops standing out (fewer than
+18 candidate cycles in the last 24).
+
+
+6. RESULTS SO FAR
+=================
+
+Simulated fleet of 32 optical modules over a year, with daily and seasonal
+temperature, per-slot spread, noise, a long-fibre module, a 3-hour 6 dB
+glitch, and a 2-day cooling failure:
+
+  laser aging (bias +14 mA over 245 days)    CHANGING alert ~6 days in
+  fibre degradation (Rx -3 dB over 275 days) CHANGING alert ~10 days in
+  false alerts (default fleet)               0
+  10 other random fleets                     degradations caught in 4-11
+                                             days; CHANGING false alerts
+                                             only briefly after the glitch
+                                             (3 fleets); DIFFERENT flags a
+                                             naturally extreme healthy module
+                                             in 4 fleets (information only)
+
+Generic test, 50 fans with 3 features: bearing wear caught 2.8 days after
+it began, with no false alerts.
+
+Cost:
+  code     about 3.9 KB of flash (iforest + robust + pod), plus 0.6 KB for
+           the CMIS adapter
+  RAM      pod_mem_size(): 6.4 KB for 32 x 7
+  time     measured on a real FRDM-MCXA153 (no FPU, software float) with
+           the earlier optics-only version, 32 modules, both views, 100
+           trees: ~520 ms per cycle. The current version makes each tree
+           split cheaper (2.4x faster on the host), so expect roughly
+           200-250 ms; not yet re-measured. Time is linear in n_trees. The
+           MCXA577 has a hardware FPU, which CONFIG_POD_FPU enables
+           automatically. At one cycle per hour, any of these is a
+           negligible load.
+
+
+7. ZEPHYR INTEGRATION
+=====================
+
+The repository is a Zephyr module. Add it via ZEPHYR_EXTRA_MODULES or a
+west manifest entry.
+
+  CONFIG_POD=y                the library
+  CONFIG_POD_FPU              default y on parts with an FPU (MCXA577,
+                              MCXA156); selects FPU, implies FPU_SHARING.
+                              Hidden on parts without one (MCXA153).
+  CONFIG_POD_CMIS=y           the optical module adapter
+  CONFIG_POD_CMIS_FLEET_SIM   the simulated fleet (demo and testing only)
+
+  cmake -S . -B build && cmake --build build && ctest --test-dir build
+  make test                       host tests with ASan/UBSan
+  make zephyr BOARD=<board>       Zephyr sample and benchmark, any board
+
+
+8. LIMITS AND CAVEATS
+=====================
+
+  - It finds the odd one out; it cannot tell you a problem is serious.
+    Severity comes from the reported feature and its z, and from you.
+  - Problems shared by the whole group are invisible by design (a bad batch,
+    a site-wide event). That's the price of ignoring room temperature.
+  - It needs peers: groups below min_group (default 8) aren't scored.
+  - Mix only like entities in a group (same model or part number), or the
+    differences between models will dominate.
+  - Isolation Forest measures how easy a point is to isolate, not how far
+    away it is. On its own it can rank a "slightly odd in three features"
+    entity above a "far out in one feature" entity. The per-feature test
+    covers that case, which is why pod uses both.
+  - The CMIS byte offsets follow CMIS 5.x and should be checked against the
+    spec and your modules. Tx bias is reported before the page 01h
+    multiplier, which is fine within a group of identical parts.
+  - So far, everything has been validated on simulated data only.
+
+
+9. WHY NOT NEUTRON (OR ANOTHER NPU)
+===================================
+
+Neutron accelerates inference of neural networks that are compiled offline.
+pod's model is refitted from live data every cycle, with splits drawn from
+the data itself, so there is nothing to compile ahead of time, and NPUs
+cannot train on-device. The work is also small (a few hundred thousand
+compares per cycle), well within what a Cortex-M CPU handles. An NPU
+becomes worthwhile if you later add a pretrained neural model, for example
+an autoencoder over raw waveforms, alongside pod.

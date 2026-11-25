@@ -1,0 +1,4 @@
+hour,day,module,view,state,top_feature,top_feature_z,degradation
+17,0.708,7,different,set,rx_power,-5.63,0.0000
+3016,125.667,19,changing,set,tx_bias,5.58,0.0231
+4960,206.667,19,different,set,tx_bias,4.10,0.3537

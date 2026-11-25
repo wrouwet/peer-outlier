@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "pod fleet_sim sample (CMIS)"
+
+config FLEET_SIM_DAYS
+	int "Simulated days to run"
+	default 365
+
+config FLEET_SIM_TREE_SWEEP
+	bool "Afterwards, time pod_update() for several forest sizes"
+	default y
+
+source "Kconfig.zephyr"

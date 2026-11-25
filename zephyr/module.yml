@@ -1,0 +1,4 @@
+name: pod
+build:
+  cmake: zephyr
+  kconfig: zephyr/Kconfig

@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+
+config POD
+	bool "Peer outlier detection (pod)"
+	help
+	  Finds the entity that stands out from its peers, from any set of
+	  numeric features, using Isolation Forests fitted on the fly plus
+	  robust per-feature statistics. No pretraining, no programmed limits.
+
+if POD
+
+config POD_FPU
+	bool "Use the hardware FPU"
+	depends on CPU_HAS_FPU
+	default y
+	select FPU
+	imply FPU_SHARING
+	help
+	  pod computes in single-precision float. On SoCs with an FPU this
+	  enables it; on SoCs without one the option is not shown and the
+	  compiler's software float is used.
+	  FPU_SHARING is implied so other threads may use float too; turn it
+	  off if pod is the only float user.
+
+config POD_CMIS
+	bool "CMIS optical module adapter"
+	help
+	  Feature extraction from cached CMIS records (lower memory + page
+	  11h) for optical modules.
+
+config POD_CMIS_FLEET_SIM
+	bool "Simulated fleet of CMIS modules"
+	depends on POD_CMIS
+	help
+	  Adds sim/fleet_sim.c, which writes realistic CMIS records for a
+	  simulated fleet. For demos and testing only.
+
+endif # POD

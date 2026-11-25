@@ -1,0 +1,61 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host:
+    name: host tests (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_BUILD_TYPE=Release
+             -DCMAKE_C_FLAGS="-Wall -Wextra -Werror -pedantic"
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Example
+        run: ./build/pod_example_basic
+
+  sanitizers:
+    name: host tests (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test HOST_CC=gcc
+
+  cross:
+    name: cross-compile (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: Cortex-M0+ (no FPU)
+            pkg: gcc-arm-none-eabi
+            cc: arm-none-eabi-gcc
+            flags: -mcpu=cortex-m0plus -mthumb
+          - name: Cortex-M4F (FPU)
+            pkg: gcc-arm-none-eabi
+            cc: arm-none-eabi-gcc
+            flags: -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+          - name: RISC-V RV32IMAC
+            pkg: gcc-riscv64-unknown-elf
+            cc: riscv64-unknown-elf-gcc
+            flags: -march=rv32imac -mabi=ilp32
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ${{ matrix.pkg }}
+      - name: Compile library (bare metal, -Os)
+        run: |
+          for f in src/iforest.c src/robust.c src/pod.c; do
+            ${{ matrix.cc }} ${{ matrix.flags }} -std=c99 -pedantic -Wall -Wextra -Werror -Os \
+              -Iinclude -c "$f" -o /dev/null
+          done
+          ${{ matrix.cc }} ${{ matrix.flags }} -std=c11 -pedantic -Wall -Wextra -Werror -Os \
+            -Iinclude -Iadapters/cmis/include -c adapters/cmis/src/pod_cmis.c -o /dev/null
