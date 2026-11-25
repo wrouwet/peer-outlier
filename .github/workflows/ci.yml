@@ -34,20 +34,21 @@ jobs:
     name: cross-compile (${{ matrix.name }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - name: Cortex-M0+ (no FPU)
-            pkg: gcc-arm-none-eabi
+            pkg: gcc-arm-none-eabi libnewlib-arm-none-eabi
             cc: arm-none-eabi-gcc
             flags: -mcpu=cortex-m0plus -mthumb
           - name: Cortex-M4F (FPU)
-            pkg: gcc-arm-none-eabi
+            pkg: gcc-arm-none-eabi libnewlib-arm-none-eabi
             cc: arm-none-eabi-gcc
             flags: -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard
           - name: RISC-V RV32IMAC
-            pkg: gcc-riscv64-unknown-elf
+            pkg: gcc-riscv64-unknown-elf picolibc-riscv64-unknown-elf
             cc: riscv64-unknown-elf-gcc
-            flags: -march=rv32imac -mabi=ilp32
+            flags: -march=rv32imac -mabi=ilp32 --specs=picolibc.specs
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y ${{ matrix.pkg }}
